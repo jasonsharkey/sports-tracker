@@ -1,13 +1,13 @@
 """
-Sports Tracker Web App  —  Multi-User Edition
-==============================================
-Each connected user gets their own isolated tracker session.
-- Their own tracker thread (sport/game/players)
-- Their own ntfy topic (entered in the UI — notifications go to their phone only)
-- All socket events scoped to their session ID so no cross-talk between users
+Sports Tracker Web App  —  Multi-User + Notification Filters
+=============================================================
+Each user gets their own isolated session with:
+  - Personal ntfy topic for push notifications
+  - Per-sport notification type filters (all selected by default)
+  - Filters are checked in the tracker thread before firing any alert
 
 Deploy on Railway:
-    - No extra config needed. Set PORT env var if required (Railway sets it automatically).
+    Start command: python3 -m gunicorn --worker-class eventlet -w 1 app:app
 
 Requirements:
     pip install flask flask-socketio requests MLB-StatsAPI eventlet gunicorn
@@ -19,7 +19,7 @@ import requests
 import requests.packages.urllib3 as urllib3
 from datetime import date, datetime
 from flask import Flask, render_template_string, jsonify, request
-from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask_socketio import SocketIO, emit, join_room
 
 # ─────────────────────────────────────────────────────────────
 #  CONFIG
@@ -37,17 +37,189 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = SECRET_KEY
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
-# ─────────────────────────────────────────────────────────────
-#  PER-USER SESSION STORE
-#  Key: socket session ID (request.sid)
-#  Value: {"thread": Thread, "stop": Event, "ntfy_url": str}
-# ─────────────────────────────────────────────────────────────
-sessions = {}
+sessions      = {}
 sessions_lock = threading.Lock()
 
+# ─────────────────────────────────────────────────────────────
+#  FILTER DEFINITIONS
+#  These are the canonical category names shown in the UI.
+#  Each sport maps raw API event strings → category name.
+# ─────────────────────────────────────────────────────────────
+
+FILTERS = {
+    "mlb": [
+        "Home Run",
+        "Hit",           # single / double / triple
+        "Out",           # groundout / flyout / lineout / popout
+        "Strikeout",
+        "Walk / HBP",
+        "RBI",           # any play with rbi > 0
+        "Scoring Play",  # any play where runs scored
+    ],
+    "nba": [
+        "Points",        # made field goals + free throws
+        "3-Pointer",
+        "Rebound",
+        "Assist",
+        "Block",
+        "Steal",
+        "Turnover",
+        "Foul",
+    ],
+    "nhl": [
+        "Goal",
+        "Assist",
+        "Shot",
+        "Block",
+        "Penalty",
+        "Save",
+    ],
+    "pga": [
+        "Eagle or better",
+        "Birdie",
+        "Par",
+        "Bogey",
+        "Double Bogey or worse",
+        "Score change",  # catches anything not mapped above
+    ],
+}
+
+# ── MLB: map result.event strings → filter category ──────────
+MLB_EVENT_MAP = {
+    # Home runs
+    "Home Run":                  "Home Run",
+    # Hits
+    "Single":                    "Hit",
+    "Double":                    "Hit",
+    "Triple":                    "Hit",
+    # Outs
+    "Groundout":                 "Out",
+    "Ground Out":                "Out",
+    "Flyout":                    "Out",
+    "Fly Out":                   "Out",
+    "Lineout":                   "Out",
+    "Line Out":                  "Out",
+    "Pop Out":                   "Out",
+    "Forceout":                  "Out",
+    "Double Play":               "Out",
+    "Triple Play":               "Out",
+    "Grounded Into DP":          "Out",
+    "Fielders Choice Out":       "Out",
+    "Fielders Choice":           "Out",
+    "Bunt Groundout":            "Out",
+    "Bunt Lineout":              "Out",
+    "Bunt Pop Out":              "Out",
+    "Sac Fly":                   "Out",
+    "Sac Bunt":                  "Out",
+    "Sac Fly Double Play":       "Out",
+    # Strikeouts
+    "Strikeout":                 "Strikeout",
+    "Strikeout Double Play":     "Strikeout",
+    # Walks / HBP
+    "Walk":                      "Walk / HBP",
+    "Intent Walk":               "Walk / HBP",
+    "Hit By Pitch":              "Walk / HBP",
+    # Misc
+    "Field Error":               "Out",
+    "Catcher Interference":      "Walk / HBP",
+}
+
+# ── NBA: map ESPN play type text → filter category ───────────
+NBA_TYPE_MAP = {
+    "Free Throw Made":           "Points",
+    "Free Throw":                "Points",
+    "Two-Point":                 "Points",
+    "Layup":                     "Points",
+    "Dunk":                      "Points",
+    "Jump Shot":                 "Points",
+    "Hook Shot":                 "Points",
+    "Tip Shot":                  "Points",
+    "Three Point":               "3-Pointer",
+    "Three-Point":               "3-Pointer",
+    "Rebound":                   "Rebound",
+    "Offensive Rebound":         "Rebound",
+    "Defensive Rebound":         "Rebound",
+    "Assist":                    "Assist",
+    "Block":                     "Block",
+    "Steal":                     "Steal",
+    "Turnover":                  "Turnover",
+    "Foul":                      "Foul",
+    "Shooting Foul":             "Foul",
+    "Offensive Foul":            "Foul",
+    "Loose Ball Foul":           "Foul",
+    "Personal Foul":             "Foul",
+    "Technical Foul":            "Foul",
+    "Flagrant Foul":             "Foul",
+}
+
+# ── NHL: map ESPN play type text → filter category ───────────
+NHL_TYPE_MAP = {
+    "Goal":                      "Goal",
+    "Power Play Goal":           "Goal",
+    "Short Handed Goal":         "Goal",
+    "Empty Net Goal":            "Goal",
+    "Penalty Shot Goal":         "Goal",
+    "Assist":                    "Assist",
+    "Shot on Goal":              "Shot",
+    "Shot":                      "Shot",
+    "Missed Shot":               "Shot",
+    "Blocked Shot":              "Block",
+    "Block":                     "Block",
+    "Penalty":                   "Penalty",
+    "Minor Penalty":             "Penalty",
+    "Major Penalty":             "Penalty",
+    "Misconduct":                "Penalty",
+    "Save":                      "Save",
+    "Goalie Save":               "Save",
+}
+
+
+def mlb_categorize(event: str, rbi: int, runs_scored: int) -> list:
+    """Return list of filter categories this MLB play belongs to."""
+    cats = set()
+    cat  = MLB_EVENT_MAP.get(event)
+    if cat:
+        cats.add(cat)
+    else:
+        # Unknown event — treat as Out if nothing else matches
+        cats.add("Out")
+    if rbi > 0:
+        cats.add("RBI")
+    if runs_scored > 0:
+        cats.add("Scoring Play")
+    return list(cats)
+
+
+def espn_categorize(play_type: str, type_map: dict) -> str:
+    """Map an ESPN play type string to a filter category."""
+    # Exact match first
+    if play_type in type_map:
+        return type_map[play_type]
+    # Partial match
+    for key, cat in type_map.items():
+        if key.lower() in play_type.lower() or play_type.lower() in key.lower():
+            return cat
+    return None
+
+
+def pga_categorize(score_to_par: int) -> list:
+    """Return PGA filter categories for a score relative to par."""
+    cats = ["Score change"]
+    if score_to_par <= -2:   cats.append("Eagle or better")
+    elif score_to_par == -1: cats.append("Birdie")
+    elif score_to_par == 0:  cats.append("Par")
+    elif score_to_par == 1:  cats.append("Bogey")
+    else:                    cats.append("Double Bogey or worse")
+    return cats
+
+
+def passes_filter(event_cats: list, active_filters: set) -> bool:
+    """True if any of the event's categories are in the user's active filter set."""
+    return bool(set(event_cats) & active_filters)
+
 
 # ─────────────────────────────────────────────────────────────
-#  PER-USER HELPERS  (all scoped to a single sid)
+#  PER-USER HELPERS
 # ─────────────────────────────────────────────────────────────
 
 def user_log(sid: str, msg: str):
@@ -68,10 +240,8 @@ def user_alert(sid: str, player: str, event: str, detail: str, sport: str):
 
 
 def user_notify(sid: str, title: str, message: str, priority: str = "default"):
-    """Send push notification to this user's personal ntfy topic."""
     with sessions_lock:
-        session = sessions.get(sid, {})
-        ntfy_url = session.get("ntfy_url")
+        ntfy_url = sessions.get(sid, {}).get("ntfy_url")
     if not ntfy_url:
         return
     safe = title.encode("ascii", errors="replace").decode("ascii")
@@ -85,8 +255,13 @@ def user_notify(sid: str, title: str, message: str, priority: str = "default"):
         user_log(sid, f"Notification error: {e}")
 
 
+def get_filters(sid: str) -> set:
+    """Return the active filter set for this user's session."""
+    with sessions_lock:
+        return set(sessions.get(sid, {}).get("filters", []))
+
+
 def stop_user_session(sid: str):
-    """Stop the tracker thread for this user if one is running."""
     with sessions_lock:
         session = sessions.get(sid)
     if session and session.get("stop"):
@@ -97,7 +272,7 @@ def stop_user_session(sid: str):
 
 
 # ─────────────────────────────────────────────────────────────
-#  ESPN HELPERS  (stateless — safe to share across users)
+#  ESPN HELPERS
 # ─────────────────────────────────────────────────────────────
 
 def espn_get(url, params=None):
@@ -174,7 +349,7 @@ def espn_status_order(event):
 
 
 # ─────────────────────────────────────────────────────────────
-#  DATA API ROUTES  (shared, read-only — safe for all users)
+#  DATA API ROUTES
 # ─────────────────────────────────────────────────────────────
 
 @app.route("/api/games/<sport>")
@@ -211,7 +386,6 @@ def api_games(sport):
         events = data.get("events",[])
         return jsonify([{"id": e["id"], "label": e.get("name","Event"),
                          "badge": "", "live": True} for e in events])
-
     else:
         mapping = {"nba": ("basketball","nba"), "nhl": ("hockey","nhl")}
         sp, lg  = mapping.get(sport, (None, None))
@@ -254,7 +428,6 @@ def api_players(sport, game_id):
                 pid = str(a.get("id","")).strip()
                 if n and pid: roster[pid] = {"name": n, "pos": ""}
         return jsonify(roster)
-
     else:
         mapping = {"nba": ("basketball","nba"), "nhl": ("hockey","nhl")}
         sp, lg  = mapping.get(sport, (None, None))
@@ -263,8 +436,14 @@ def api_players(sport, game_id):
         return jsonify({pid: {"name": name, "pos": ""} for pid, name in raw.items()})
 
 
+@app.route("/api/filters/<sport>")
+def api_filters(sport):
+    """Return the filter options for a given sport."""
+    return jsonify(FILTERS.get(sport, []))
+
+
 # ─────────────────────────────────────────────────────────────
-#  TRACKER THREADS  (one per user session)
+#  TRACKER THREADS
 # ─────────────────────────────────────────────────────────────
 
 def track_mlb(sid, game_id, player_ids, player_names, stop_event):
@@ -290,6 +469,7 @@ def track_mlb(sid, game_id, player_ids, player_names, stop_event):
             half  = ls.get("inningHalf","")
             score = f"{ar}-{hr} ({half} {inn})"
 
+            active_filters = get_filters(sid)
             new = 0
             for play in plays:
                 about    = play.get("about",{})
@@ -303,15 +483,22 @@ def track_mlb(sid, game_id, player_ids, player_names, stop_event):
                 batter_id = int(batter_id)
                 if batter_id not in player_ids: continue
 
-                result = play.get("result",{})
-                event  = result.get("event","At-bat")
-                desc   = result.get("description","") or event
-                rbi    = result.get("rbi",0)
-                h      = "Top" if about.get("halfInning")=="top" else "Bot"
-                inn_n  = about.get("inning","?")
-                extra  = f" ({rbi} RBI)" if rbi else ""
-                detail = f"{h} {inn_n} | Score: {score}\n{desc}{extra}"
-                name   = player_names[batter_id]
+                result      = play.get("result",{})
+                event       = result.get("event","At-bat")
+                desc        = result.get("description","") or event
+                rbi         = result.get("rbi", 0)
+                runs_scored = result.get("runs", 0)
+                h           = "Top" if about.get("halfInning")=="top" else "Bot"
+                inn_n       = about.get("inning","?")
+                extra       = f" ({rbi} RBI)" if rbi else ""
+                detail      = f"{h} {inn_n} | Score: {score}\n{desc}{extra}"
+                name        = player_names[batter_id]
+
+                # Filter check
+                event_cats = mlb_categorize(event, rbi, runs_scored)
+                if not passes_filter(event_cats, active_filters):
+                    user_log(sid, f"Filtered out: {name} — {event} {event_cats}")
+                    continue
 
                 user_log(sid, f"{name}: {event}")
                 user_alert(sid, name, event, detail, "MLB")
@@ -326,7 +513,8 @@ def track_mlb(sid, game_id, player_ids, player_names, stop_event):
 
 
 def track_espn(sid, sport, league, sport_label, game_id, title, player_ids, player_names, stop_event):
-    seen = set()
+    type_map = NBA_TYPE_MAP if sport_label == "NBA" else NHL_TYPE_MAP
+    seen     = set()
     user_log(sid, f"{sport_label} tracker started — {', '.join(player_names.values())}")
     while not stop_event.is_set():
         try:
@@ -337,9 +525,11 @@ def track_espn(sid, sport, league, sport_label, game_id, title, player_ids, play
                 user_notify(sid, f"{sport_label} Final: {title}", score, "low")
                 break
 
-            plays = summary.get("plays",[])
-            score = espn_score_str(summary)
-            new   = 0
+            plays          = summary.get("plays",[])
+            score          = espn_score_str(summary)
+            active_filters = get_filters(sid)
+            new            = 0
+
             for play in plays:
                 play_id = str(play.get("id","")).strip()
                 if not play_id or play_id in seen: continue
@@ -355,6 +545,11 @@ def track_espn(sid, sport, league, sport_label, game_id, title, player_ids, play
                 clock     = play.get("clock",{}).get("displayValue","")
                 time_str  = f"Q{period} {clock}" if sport_label=="NBA" else f"P{period} {clock}"
                 detail    = f"{time_str} | {score}\n{text or play_type}"
+
+                # Filter check
+                event_cat = espn_categorize(play_type, type_map)
+                if event_cat and not passes_filter([event_cat], active_filters):
+                    continue
 
                 for pid in matching:
                     name = player_names[pid]
@@ -372,6 +567,7 @@ def track_espn(sid, sport, league, sport_label, game_id, title, player_ids, play
 
 def track_pga(sid, event_id, event_name, player_ids, player_names, stop_event):
     last_snapshot = {}
+    last_scores   = {}   # pid -> last known score-to-par int
     user_log(sid, f"PGA tracker started — {', '.join(player_names.values())}")
     while not stop_event.is_set():
         try:
@@ -380,6 +576,7 @@ def track_pga(sid, event_id, event_name, player_ids, player_names, stop_event):
             for comp in summary.get("competitions",[]):
                 competitors.extend(comp.get("competitors",[]))
 
+            active_filters = get_filters(sid)
             new = 0
             for c in competitors:
                 athlete = c.get("athlete",{})
@@ -397,6 +594,17 @@ def track_pga(sid, event_id, event_name, player_ids, player_names, stop_event):
 
                 if last_snapshot.get(pid) == snapshot: continue
                 last_snapshot[pid] = snapshot
+
+                # Try to parse score-to-par for category mapping
+                try:
+                    score_int = int(score.replace("E","0").replace("+",""))
+                except Exception:
+                    score_int = None
+
+                event_cats = pga_categorize(score_int) if score_int is not None else ["Score change"]
+
+                if not passes_filter(event_cats, active_filters):
+                    continue
 
                 rounds_str = "  ".join(f"R{i+1}:{s}" for i,s in enumerate(rounds))
                 detail     = f"Score: {score}  Thru: {thru}\nStatus: {status}\n{rounds_str}".strip()
@@ -423,10 +631,10 @@ def track_pga(sid, event_id, event_name, player_ids, player_names, stop_event):
 @socketio.on("connect")
 def on_connect():
     sid = request.sid
-    join_room(sid)  # each user is in their own room = their sid
+    join_room(sid)
     with sessions_lock:
-        sessions[sid] = {"thread": None, "stop": None, "ntfy_url": None}
-    print(f"[+] User connected: {sid[:8]}")
+        sessions[sid] = {"thread": None, "stop": None, "ntfy_url": None, "filters": []}
+    print(f"[+] Connected: {sid[:8]}")
 
 
 @socketio.on("disconnect")
@@ -435,12 +643,11 @@ def on_disconnect():
     stop_user_session(sid)
     with sessions_lock:
         sessions.pop(sid, None)
-    print(f"[-] User disconnected: {sid[:8]}")
+    print(f"[-] Disconnected: {sid[:8]}")
 
 
 @socketio.on("set_ntfy_topic")
 def on_set_ntfy(data):
-    """User submits their personal ntfy topic from the UI."""
     sid   = request.sid
     topic = data.get("topic","").strip()
     if not topic:
@@ -450,12 +657,10 @@ def on_set_ntfy(data):
     with sessions_lock:
         if sid in sessions:
             sessions[sid]["ntfy_url"] = ntfy_url
-    # Send a test notification so they know it's working
     try:
         requests.post(ntfy_url,
                       data="Sports Tracker connected! You will receive alerts here.".encode(),
-                      headers={"Title": "Sports Tracker Ready",
-                               "Tags": "white_check_mark",
+                      headers={"Title": "Sports Tracker Ready", "Tags": "white_check_mark",
                                "Content-Type": "text/plain; charset=utf-8"},
                       timeout=10)
         emit("ntfy_status", {"ok": True, "msg": f"Connected to topic: {topic}"})
@@ -469,56 +674,53 @@ def on_start_tracking(data):
     sport      = data.get("sport","").lower()
     game_id    = data.get("game_id")
     game_label = data.get("game_label","Game")
-    players    = data.get("players",{})  # {id: name}
+    players    = data.get("players",{})
+    filters    = data.get("filters", FILTERS.get(sport, []))  # default = all
 
     if not game_id or not players:
         emit("log", {"text": "No game or players selected."})
         return
 
-    # Stop any existing tracker for this user
     stop_user_session(sid)
-
     stop_event = threading.Event()
+
     with sessions_lock:
         if sid in sessions:
-            sessions[sid]["stop"] = stop_event
+            sessions[sid]["stop"]    = stop_event
+            sessions[sid]["filters"] = filters  # store active filter set
 
+    user_log(sid, f"Active filters: {', '.join(filters)}")
     user_notify(sid, f"Tracking {game_label}",
                 f"Watching: {', '.join(players.values())}", "low")
-    user_log(sid, f"Starting {sport.upper()} tracker for {game_label}")
 
     if sport == "mlb":
         pid_map = {int(k): v for k, v in players.items()}
-        t = threading.Thread(
-            target=track_mlb,
-            args=(sid, int(game_id), set(pid_map.keys()), pid_map, stop_event),
-            daemon=True)
+        t = threading.Thread(target=track_mlb,
+                             args=(sid, int(game_id), set(pid_map.keys()), pid_map, stop_event),
+                             daemon=True)
 
     elif sport in ("nba","nhl"):
         sport_map = {"nba": ("basketball","nba","NBA"), "nhl": ("hockey","nhl","NHL")}
         sp, lg, label = sport_map[sport]
-        t = threading.Thread(
-            target=track_espn,
-            args=(sid, sp, lg, label, game_id, game_label,
-                  set(players.keys()), players, stop_event),
-            daemon=True)
+        t = threading.Thread(target=track_espn,
+                             args=(sid, sp, lg, label, game_id, game_label,
+                                   set(players.keys()), players, stop_event),
+                             daemon=True)
 
     elif sport == "pga":
-        t = threading.Thread(
-            target=track_pga,
-            args=(sid, game_id, game_label,
-                  set(players.keys()), players, stop_event),
-            daemon=True)
-
+        t = threading.Thread(target=track_pga,
+                             args=(sid, game_id, game_label,
+                                   set(players.keys()), players, stop_event),
+                             daemon=True)
     else:
-        emit("log", {"text": f"Unknown sport: {sport}"})
-        return
+        emit("log", {"text": f"Unknown sport: {sport}"}); return
 
     with sessions_lock:
         if sid in sessions:
             sessions[sid]["thread"] = t
     t.start()
-    emit("tracking_started", {"game": game_label, "players": list(players.values())})
+    emit("tracking_started", {"game": game_label, "players": list(players.values()),
+                               "filters": filters})
 
 
 @socketio.on("stop_tracking")
@@ -542,99 +744,87 @@ HTML = r"""<!DOCTYPE html>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=Barlow:wght@400;500&display=swap');
   :root {
-    --bg:      #0a0e17;
-    --surface: #111827;
-    --card:    #1a2235;
-    --border:  #2a3a55;
-    --accent:  #f59e0b;
-    --accent2: #3b82f6;
-    --green:   #10b981;
-    --red:     #ef4444;
-    --text:    #e2e8f0;
-    --muted:   #64748b;
+    --bg:#0a0e17; --surface:#111827; --card:#1a2235; --border:#2a3a55;
+    --accent:#f59e0b; --accent2:#3b82f6; --green:#10b981; --red:#ef4444;
+    --text:#e2e8f0; --muted:#64748b;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: 'Barlow', sans-serif; min-height: 100vh; padding-bottom: 2rem; }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:var(--bg);color:var(--text);font-family:'Barlow',sans-serif;min-height:100vh;padding-bottom:2rem;}
+  header{background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 100%);border-bottom:2px solid var(--accent);padding:1.2rem 1.5rem;display:flex;align-items:center;gap:1rem;}
+  header h1{font-family:'Barlow Condensed',sans-serif;font-weight:900;font-size:1.6rem;letter-spacing:.05em;text-transform:uppercase;color:#fff;}
+  header h1 span{color:var(--accent);}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--muted);flex-shrink:0;transition:background .3s;}
+  .dot.live{background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 1.5s infinite;}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .container{max-width:680px;margin:0 auto;padding:1.5rem 1rem;}
+  .step{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.2rem;margin-bottom:1rem;transition:opacity .3s;}
+  .step.disabled{opacity:.35;pointer-events:none;}
+  .step-label{font-family:'Barlow Condensed',sans-serif;font-size:.75rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin-bottom:.7rem;}
+  .btn-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:.5rem;}
+  .btn-grid.tight{grid-template-columns:repeat(auto-fill,minmax(110px,1fr));}
+  button{background:var(--card);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:.65rem .8rem;font-family:'Barlow',sans-serif;font-size:.88rem;font-weight:500;cursor:pointer;text-align:left;transition:border-color .15s,background .15s,transform .1s;line-height:1.3;}
+  button:active{transform:scale(.97);}
+  button:hover{border-color:var(--accent2);background:#1f3050;}
+  button.selected{border-color:var(--accent);background:#2a1f00;color:var(--accent);}
+  button.player-btn.selected{border-color:var(--green);background:#0d2a1f;color:var(--green);}
+  button.game-btn .badge{display:block;font-size:.72rem;color:var(--muted);margin-top:2px;}
+  button.game-btn.live-game{border-color:#16a34a;}
+  button.game-btn.live-game .badge{color:var(--green);}
 
-  header {
-    background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);
-    border-bottom: 2px solid var(--accent);
-    padding: 1.2rem 1.5rem;
-    display: flex; align-items: center; gap: 1rem;
-  }
-  header h1 { font-family: 'Barlow Condensed', sans-serif; font-weight: 900; font-size: 1.6rem; letter-spacing: 0.05em; text-transform: uppercase; color: #fff; }
-  header h1 span { color: var(--accent); }
-  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex-shrink: 0; transition: background 0.3s; }
-  .dot.live { background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 1.5s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.4} }
+  /* Filter chips */
+  .filter-grid{display:flex;flex-wrap:wrap;gap:.4rem;}
+  .filter-chip{display:inline-flex;align-items:center;gap:.35rem;background:var(--card);border:1.5px solid var(--green);color:var(--green);border-radius:20px;padding:.35rem .75rem;font-size:.8rem;font-weight:600;cursor:pointer;transition:background .15s,color .15s,border-color .15s;user-select:none;}
+  .filter-chip:hover{background:#0d2a1f;}
+  .filter-chip.off{border-color:var(--border);color:var(--muted);background:var(--card);}
+  .filter-chip.off:hover{border-color:var(--accent2);color:var(--text);}
+  .filter-chip .chip-dot{width:7px;height:7px;border-radius:50%;background:var(--green);flex-shrink:0;}
+  .filter-chip.off .chip-dot{background:var(--muted);}
+  .filter-actions{display:flex;gap:.5rem;margin-bottom:.6rem;}
+  .filter-actions button{font-size:.75rem;padding:.3rem .7rem;border-radius:6px;color:var(--muted);}
+  .filter-actions button:hover{color:var(--text);}
 
-  .container { max-width: 680px; margin: 0 auto; padding: 1.5rem 1rem; }
-
-  .step { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.2rem; margin-bottom: 1rem; transition: opacity 0.3s; }
-  .step.disabled { opacity: 0.35; pointer-events: none; }
-  .step-label { font-family: 'Barlow Condensed', sans-serif; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); margin-bottom: 0.7rem; }
-
-  .btn-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 0.5rem; }
-  .btn-grid.tight { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); }
-
-  button { background: var(--card); border: 1.5px solid var(--border); color: var(--text); border-radius: 8px; padding: 0.65rem 0.8rem; font-family: 'Barlow', sans-serif; font-size: 0.88rem; font-weight: 500; cursor: pointer; text-align: left; transition: border-color 0.15s, background 0.15s, transform 0.1s; line-height: 1.3; }
-  button:active { transform: scale(0.97); }
-  button:hover  { border-color: var(--accent2); background: #1f3050; }
-  button.selected { border-color: var(--accent); background: #2a1f00; color: var(--accent); }
-  button.player-btn.selected { border-color: var(--green); background: #0d2a1f; color: var(--green); }
-  button.game-btn .badge { display: block; font-size: 0.72rem; color: var(--muted); margin-top: 2px; }
-  button.game-btn.live-game { border-color: #16a34a; }
-  button.game-btn.live-game .badge { color: var(--green); }
-
-  .action-row { display: flex; gap: 0.6rem; margin-top: 0.5rem; }
-  .btn-start { flex: 1; background: var(--accent); border-color: var(--accent); color: #000; font-weight: 700; font-family: 'Barlow Condensed', sans-serif; font-size: 1rem; letter-spacing: 0.05em; text-transform: uppercase; text-align: center; padding: 0.8rem; border-radius: 8px; }
-  .btn-start:hover { background: #d97706; border-color: #d97706; color: #000; }
-  .btn-start:disabled { opacity: 0.4; cursor: not-allowed; }
-  .btn-stop { background: transparent; border-color: var(--red); color: var(--red); font-weight: 600; text-align: center; padding: 0.8rem 1.2rem; border-radius: 8px; }
-  .btn-stop:hover { background: #2a1010; }
-
-  .selection-summary { font-size: 0.82rem; color: var(--muted); margin-top: 0.6rem; min-height: 1.2em; }
-  .selection-summary strong { color: var(--text); }
-
-  /* ntfy input */
-  .ntfy-row { display: flex; gap: 0.5rem; align-items: stretch; }
-  .ntfy-row input { flex: 1; background: var(--card); border: 1.5px solid var(--border); border-radius: 8px; padding: 0.6rem 0.8rem; color: var(--text); font-family: 'Barlow', sans-serif; font-size: 0.9rem; outline: none; }
-  .ntfy-row input:focus { border-color: var(--accent2); }
-  .ntfy-row input::placeholder { color: var(--muted); }
-  .btn-ntfy { background: var(--accent2); border-color: var(--accent2); color: #fff; font-weight: 600; font-size: 0.85rem; padding: 0.6rem 1rem; border-radius: 8px; text-align: center; white-space: nowrap; }
-  .btn-ntfy:hover { background: #2563eb; border-color: #2563eb; }
-  .ntfy-status { font-size: 0.8rem; margin-top: 0.5rem; min-height: 1.2em; }
-  .ntfy-status.ok  { color: var(--green); }
-  .ntfy-status.err { color: var(--red); }
-
-  .search-wrap { position: relative; margin-bottom: 0.6rem; }
-  .search-wrap input { width: 100%; background: var(--card); border: 1.5px solid var(--border); border-radius: 8px; padding: 0.6rem 0.8rem; color: var(--text); font-family: 'Barlow', sans-serif; font-size: 0.9rem; outline: none; }
-  .search-wrap input:focus { border-color: var(--accent2); }
-  .search-wrap input::placeholder { color: var(--muted); }
-
-  .feed-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; margin-bottom: 1rem; }
-  .feed-header { background: var(--card); padding: 0.7rem 1rem; font-family: 'Barlow Condensed', sans-serif; font-size: 0.8rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
-  #status-badge { font-size: 0.72rem; background: var(--bg); border-radius: 4px; padding: 2px 7px; color: var(--muted); }
-  #status-badge.active { color: var(--green); border: 1px solid var(--green); }
-
-  #alerts-list { padding: 0.5rem; }
-  .alert-card { background: var(--card); border-left: 3px solid var(--accent); border-radius: 6px; padding: 0.7rem 0.9rem; margin-bottom: 0.4rem; animation: slideIn 0.3s ease; }
-  .alert-card.nba { border-color: #f97316; }
-  .alert-card.nhl { border-color: #a78bfa; }
-  .alert-card.mlb { border-color: var(--accent); }
-  .alert-card.pga { border-color: var(--green); }
-  @keyframes slideIn { from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none} }
-  .alert-player { font-family: 'Barlow Condensed', sans-serif; font-size: 1rem; font-weight: 700; color: #fff; }
-  .alert-event  { font-size: 0.78rem; color: var(--accent); font-weight: 600; margin: 1px 0; }
-  .alert-detail { font-size: 0.8rem; color: var(--muted); white-space: pre-line; }
-  .alert-time   { font-size: 0.7rem; color: var(--border); float: right; }
-
-  #log-panel { background: #070b12; border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem 0.8rem; font-family: 'Barlow Condensed', monospace; font-size: 0.78rem; color: var(--muted); max-height: 130px; overflow-y: auto; }
-  #log-panel div { margin-bottom: 1px; }
-
-  .empty-state { text-align: center; padding: 2rem 1rem; color: var(--muted); font-size: 0.88rem; }
-  .loader { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: middle; margin-left: 6px; }
-  @keyframes spin { to{transform:rotate(360deg)} }
+  .action-row{display:flex;gap:.6rem;margin-top:.5rem;}
+  .btn-start{flex:1;background:var(--accent);border-color:var(--accent);color:#000;font-weight:700;font-family:'Barlow Condensed',sans-serif;font-size:1rem;letter-spacing:.05em;text-transform:uppercase;text-align:center;padding:.8rem;border-radius:8px;}
+  .btn-start:hover{background:#d97706;border-color:#d97706;color:#000;}
+  .btn-start:disabled{opacity:.4;cursor:not-allowed;}
+  .btn-stop{background:transparent;border-color:var(--red);color:var(--red);font-weight:600;text-align:center;padding:.8rem 1.2rem;border-radius:8px;}
+  .btn-stop:hover{background:#2a1010;}
+  .selection-summary{font-size:.82rem;color:var(--muted);margin-top:.6rem;min-height:1.2em;}
+  .selection-summary strong{color:var(--text);}
+  .ntfy-row{display:flex;gap:.5rem;align-items:stretch;}
+  .ntfy-row input,.search-wrap input{background:var(--card);border:1.5px solid var(--border);border-radius:8px;padding:.6rem .8rem;color:var(--text);font-family:'Barlow',sans-serif;font-size:.9rem;outline:none;}
+  .ntfy-row input{flex:1;}
+  .ntfy-row input:focus,.search-wrap input:focus{border-color:var(--accent2);}
+  .ntfy-row input::placeholder,.search-wrap input::placeholder{color:var(--muted);}
+  .btn-ntfy{background:var(--accent2);border-color:var(--accent2);color:#fff;font-weight:600;font-size:.85rem;padding:.6rem 1rem;border-radius:8px;text-align:center;white-space:nowrap;}
+  .btn-ntfy:hover{background:#2563eb;border-color:#2563eb;}
+  .ntfy-status{font-size:.8rem;margin-top:.5rem;min-height:1.2em;}
+  .ntfy-status.ok{color:var(--green);}
+  .ntfy-status.err{color:var(--red);}
+  .search-wrap{position:relative;margin-bottom:.6rem;}
+  .search-wrap input{width:100%;}
+  .feed-panel{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:1rem;}
+  .feed-header{background:var(--card);padding:.7rem 1rem;font-family:'Barlow Condensed',sans-serif;font-size:.8rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between;align-items:center;}
+  #status-badge{font-size:.72rem;background:var(--bg);border-radius:4px;padding:2px 7px;color:var(--muted);}
+  #status-badge.active{color:var(--green);border:1px solid var(--green);}
+  #alerts-list{padding:.5rem;}
+  .alert-card{background:var(--card);border-left:3px solid var(--accent);border-radius:6px;padding:.7rem .9rem;margin-bottom:.4rem;animation:slideIn .3s ease;}
+  .alert-card.nba{border-color:#f97316;}
+  .alert-card.nhl{border-color:#a78bfa;}
+  .alert-card.mlb{border-color:var(--accent);}
+  .alert-card.pga{border-color:var(--green);}
+  @keyframes slideIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+  .alert-player{font-family:'Barlow Condensed',sans-serif;font-size:1rem;font-weight:700;color:#fff;}
+  .alert-event{font-size:.78rem;color:var(--accent);font-weight:600;margin:1px 0;}
+  .alert-detail{font-size:.8rem;color:var(--muted);white-space:pre-line;}
+  .alert-time{font-size:.7rem;color:var(--border);float:right;}
+  #log-panel{background:#070b12;border:1px solid var(--border);border-radius:8px;padding:.6rem .8rem;font-family:'Barlow Condensed',monospace;font-size:.78rem;color:var(--muted);max-height:130px;overflow-y:auto;}
+  #log-panel div{margin-bottom:1px;}
+  .empty-state{text-align:center;padding:2rem 1rem;color:var(--muted);font-size:.88rem;}
+  .loader{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-left:6px;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .active-filters-summary{font-size:.78rem;color:var(--muted);margin-top:.5rem;}
+  .active-filters-summary strong{color:var(--green);}
 </style>
 </head>
 <body>
@@ -644,12 +834,10 @@ HTML = r"""<!DOCTYPE html>
 </header>
 <div class="container">
 
-  <!-- STEP 0: NTFY TOPIC -->
+  <!-- STEP 0: NTFY -->
   <div class="step" id="step-ntfy">
     <div class="step-label">Step 1 — Connect Your iPhone Notifications</div>
-    <p style="font-size:0.83rem;color:var(--muted);margin-bottom:0.7rem;">
-      Install the free <strong style="color:var(--text)">ntfy</strong> app on your iPhone, subscribe to any topic name you choose, then enter it below.
-    </p>
+    <p style="font-size:.83rem;color:var(--muted);margin-bottom:.7rem;">Install the free <strong style="color:var(--text)">ntfy</strong> app on your iPhone, subscribe to any topic name you choose, then enter it below.</p>
     <div class="ntfy-row">
       <input type="text" id="ntfy-input" placeholder="your-topic-name" autocapitalize="none" autocorrect="off">
       <button class="btn-ntfy" onclick="connectNtfy()">Connect</button>
@@ -685,9 +873,21 @@ HTML = r"""<!DOCTYPE html>
     <div class="selection-summary" id="player-summary"></div>
   </div>
 
-  <!-- STEP 4: START -->
+  <!-- STEP 4: FILTERS -->
+  <div class="step disabled" id="step-filters">
+    <div class="step-label">Step 5 — Notification Filters</div>
+    <p style="font-size:.82rem;color:var(--muted);margin-bottom:.7rem;">Choose which events trigger a notification. All are on by default — tap to toggle off.</p>
+    <div class="filter-actions">
+      <button onclick="setAllFilters(true)">Select All</button>
+      <button onclick="setAllFilters(false)">Clear All</button>
+    </div>
+    <div class="filter-grid" id="filter-chips"></div>
+    <div class="active-filters-summary" id="filter-summary"></div>
+  </div>
+
+  <!-- STEP 5: START -->
   <div class="step disabled" id="step-start">
-    <div class="step-label">Step 5 — Start Tracking</div>
+    <div class="step-label">Step 6 — Start Tracking</div>
     <div class="action-row">
       <button class="btn-start" id="btn-start" onclick="startTracking()" disabled>Start Tracking</button>
       <button class="btn-stop" onclick="stopTracking()">Stop</button>
@@ -696,10 +896,7 @@ HTML = r"""<!DOCTYPE html>
 
   <!-- LIVE FEED -->
   <div class="feed-panel" id="feed-panel" style="display:none">
-    <div class="feed-header">
-      Live Alerts
-      <span id="status-badge">Idle</span>
-    </div>
+    <div class="feed-header">Live Alerts <span id="status-badge">Idle</span></div>
     <div id="alerts-list"><div class="empty-state" style="padding:1.5rem">Waiting for plays...</div></div>
   </div>
 
@@ -712,19 +909,18 @@ HTML = r"""<!DOCTYPE html>
 </div>
 <script>
 const socket = io();
-let ntfyConnected  = false;
-let selectedSport  = null;
-let selectedGame   = null;
+let ntfyConnected   = false;
+let selectedSport   = null;
+let selectedGame    = null;
 let selectedPlayers = {};
-let allPlayers     = {};
+let allPlayers      = {};
+let allFilters      = [];    // full list for current sport
+let activeFilters   = new Set();  // currently ON filters
 
 // ── Connection ───────────────────────────────────────────────
 socket.on("connect",    () => document.getElementById("conn-dot").classList.add("live"));
 socket.on("disconnect", () => document.getElementById("conn-dot").classList.remove("live"));
-
-// ── Live events — scoped to this user only by the server ─────
-socket.on("log", data => appendLog(data.text));
-
+socket.on("log",   data => appendLog(data.text));
 socket.on("alert", data => {
   document.getElementById("feed-panel").style.display = "block";
   const list  = document.getElementById("alerts-list");
@@ -732,31 +928,22 @@ socket.on("alert", data => {
   if (empty) empty.remove();
   const card = document.createElement("div");
   card.className = `alert-card ${data.sport.toLowerCase()}`;
-  card.innerHTML = `
-    <span class="alert-time">${data.time}</span>
-    <div class="alert-player">${data.player}</div>
-    <div class="alert-event">${data.event}</div>
-    <div class="alert-detail">${data.detail}</div>`;
+  card.innerHTML = `<span class="alert-time">${data.time}</span><div class="alert-player">${data.player}</div><div class="alert-event">${data.event}</div><div class="alert-detail">${data.detail}</div>`;
   list.insertBefore(card, list.firstChild);
   while (list.children.length > 30) list.removeChild(list.lastChild);
 });
-
 socket.on("tracking_started", data => {
   document.getElementById("status-badge").textContent = "LIVE";
   document.getElementById("status-badge").classList.add("active");
   document.getElementById("feed-panel").style.display = "block";
   document.getElementById("log-panel-wrap").style.display = "block";
-  appendLog(`Tracking: ${data.game} | ${data.players.join(", ")}`);
+  appendLog(`Tracking: ${data.game} | ${data.players.join(", ")} | Filters: ${data.filters.join(", ")}`);
 });
-
 socket.on("ntfy_status", data => {
   const el = document.getElementById("ntfy-status");
   el.textContent = data.msg;
   el.className   = "ntfy-status " + (data.ok ? "ok" : "err");
-  if (data.ok) {
-    ntfyConnected = true;
-    setStep("step-sport", false);  // unlock sport selection
-  }
+  if (data.ok) { ntfyConnected = true; setStep("step-sport", false); }
 });
 
 // ── Step 0: ntfy ─────────────────────────────────────────────
@@ -770,19 +957,18 @@ function connectNtfy() {
 
 // ── Step 1: Sport ─────────────────────────────────────────────
 function selectSport(sport, btn) {
-  selectedSport   = sport;
-  selectedGame    = null;
-  selectedPlayers = {};
-  allPlayers      = {};
-
+  selectedSport = sport; selectedGame = null; selectedPlayers = {};
+  allPlayers = {}; allFilters = []; activeFilters = new Set();
   document.querySelectorAll("#step-sport button").forEach(b => b.classList.remove("selected"));
   btn.classList.add("selected");
-
   setStep("step-game", false);
   setStep("step-players", true);
+  setStep("step-filters", true);
   setStep("step-start", true);
   document.getElementById("games-list").innerHTML = '<div class="empty-state"><span class="loader"></span> Loading...</div>';
   document.getElementById("players-list").innerHTML = '<div class="empty-state">Select a game first</div>';
+  document.getElementById("filter-chips").innerHTML = '';
+  document.getElementById("filter-summary").textContent = '';
   document.getElementById("game-summary").textContent = "";
   document.getElementById("player-summary").textContent = "";
   updateStartBtn();
@@ -794,11 +980,11 @@ function selectSport(sport, btn) {
       if (!games.length) { list.innerHTML = '<div class="empty-state">No games today</div>'; return; }
       list.innerHTML = "";
       games.forEach(g => {
-        const btn = document.createElement("button");
-        btn.className = "game-btn" + (g.live ? " live-game" : "");
-        btn.innerHTML = `${g.label}<span class="badge">${g.badge}</span>`;
-        btn.onclick   = () => selectGame(g, btn);
-        list.appendChild(btn);
+        const b = document.createElement("button");
+        b.className = "game-btn" + (g.live ? " live-game" : "");
+        b.innerHTML = `${g.label}<span class="badge">${g.badge}</span>`;
+        b.onclick   = () => selectGame(g, b);
+        list.appendChild(b);
       });
     })
     .catch(() => document.getElementById("games-list").innerHTML = '<div class="empty-state">Failed to load games</div>');
@@ -806,9 +992,7 @@ function selectSport(sport, btn) {
 
 // ── Step 2: Game ──────────────────────────────────────────────
 function selectGame(game, btn) {
-  selectedGame    = game;
-  selectedPlayers = {};
-  allPlayers      = {};
+  selectedGame = game; selectedPlayers = {}; allPlayers = {};
   document.querySelectorAll(".game-btn").forEach(b => b.classList.remove("selected"));
   btn.classList.add("selected");
   document.getElementById("game-summary").innerHTML = `<strong>${game.label}</strong>`;
@@ -827,6 +1011,7 @@ function selectGame(game, btn) {
       allPlayers = players;
       setStep("step-players", false);
       renderPlayers(players);
+      loadFilters();  // load filters once sport is confirmed
     })
     .catch(() => {
       document.getElementById("players-list").innerHTML = '<div class="empty-state">Failed to load players</div>';
@@ -835,26 +1020,25 @@ function selectGame(game, btn) {
 }
 
 function renderPlayers(players) {
-  const list    = document.getElementById("players-list");
-  const q       = document.getElementById("player-search").value.toLowerCase();
+  const list = document.getElementById("players-list");
+  const q    = document.getElementById("player-search").value.toLowerCase();
   list.innerHTML = "";
   const entries = Object.entries(players)
     .filter(([id, p]) => p.name.toLowerCase().includes(q))
     .sort((a, b) => a[1].name.localeCompare(b[1].name));
   if (!entries.length) { list.innerHTML = '<div class="empty-state">No players found</div>'; return; }
   entries.forEach(([id, p]) => {
-    const btn = document.createElement("button");
-    btn.className   = "player-btn" + (selectedPlayers[id] ? " selected" : "");
-    btn.textContent = p.name + (p.pos ? ` (${p.pos})` : "");
-    btn.dataset.id  = id;
-    btn.onclick     = () => togglePlayer(id, p.name, btn);
-    list.appendChild(btn);
+    const b = document.createElement("button");
+    b.className   = "player-btn" + (selectedPlayers[id] ? " selected" : "");
+    b.textContent = p.name + (p.pos ? ` (${p.pos})` : "");
+    b.dataset.id  = id;
+    b.onclick     = () => togglePlayer(id, p.name, b);
+    list.appendChild(b);
   });
 }
 
 function filterPlayers() { renderPlayers(allPlayers); }
 
-// ── Step 3: Players ───────────────────────────────────────────
 function togglePlayer(id, name, btn) {
   if (selectedPlayers[id]) { delete selectedPlayers[id]; btn.classList.remove("selected"); }
   else                      { selectedPlayers[id] = name;  btn.classList.add("selected"); }
@@ -864,9 +1048,69 @@ function togglePlayer(id, name, btn) {
   updateStartBtn();
 }
 
-// ── Step 4: Start ─────────────────────────────────────────────
+// ── Step 4: Filters ───────────────────────────────────────────
+function loadFilters() {
+  fetch(`/api/filters/${selectedSport}`)
+    .then(r => r.json())
+    .then(filters => {
+      allFilters    = filters;
+      activeFilters = new Set(filters);  // all ON by default
+      setStep("step-filters", false);
+      renderFilterChips();
+    });
+}
+
+function renderFilterChips() {
+  const container = document.getElementById("filter-chips");
+  container.innerHTML = "";
+  allFilters.forEach(f => {
+    const chip = document.createElement("div");
+    const on   = activeFilters.has(f);
+    chip.className   = "filter-chip" + (on ? "" : " off");
+    chip.innerHTML   = `<span class="chip-dot"></span>${f}`;
+    chip.onclick     = () => toggleFilter(f, chip);
+    container.appendChild(chip);
+  });
+  updateFilterSummary();
+  updateStartBtn();
+}
+
+function toggleFilter(name, chip) {
+  if (activeFilters.has(name)) {
+    activeFilters.delete(name);
+    chip.classList.add("off");
+  } else {
+    activeFilters.add(name);
+    chip.classList.remove("off");
+  }
+  updateFilterSummary();
+  updateStartBtn();
+}
+
+function setAllFilters(on) {
+  if (on) activeFilters = new Set(allFilters);
+  else    activeFilters.clear();
+  renderFilterChips();
+}
+
+function updateFilterSummary() {
+  const on  = activeFilters.size;
+  const tot = allFilters.length;
+  const el  = document.getElementById("filter-summary");
+  if (on === tot) {
+    el.innerHTML = `<strong>${on}</strong> of ${tot} filters active (all)`;
+  } else if (on === 0) {
+    el.innerHTML = `<span style="color:var(--red)">No filters active — no notifications will fire</span>`;
+  } else {
+    el.innerHTML = `<strong>${on}</strong> of ${tot} active: ${[...activeFilters].join(", ")}`;
+  }
+}
+
+// ── Step 5: Start ─────────────────────────────────────────────
 function updateStartBtn() {
-  const ok = selectedSport && selectedGame && Object.keys(selectedPlayers).length > 0;
+  const ok = selectedSport && selectedGame &&
+             Object.keys(selectedPlayers).length > 0 &&
+             activeFilters.size > 0;
   document.getElementById("btn-start").disabled = !ok;
   setStep("step-start", !ok);
 }
@@ -881,6 +1125,7 @@ function startTracking() {
     game_id:    selectedGame.id,
     game_label: selectedGame.label,
     players:    selectedPlayers,
+    filters:    [...activeFilters],
   });
 }
 
@@ -890,7 +1135,6 @@ function stopTracking() {
   document.getElementById("status-badge").classList.remove("active");
 }
 
-// ── Log ───────────────────────────────────────────────────────
 function appendLog(text) {
   const panel = document.getElementById("log-panel");
   const line  = document.createElement("div");
