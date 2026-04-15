@@ -3,3 +3,4 @@ flask-socketio
 requests
 MLB-StatsAPI
 eventlet
+gunicorn
