@@ -65,6 +65,7 @@ FILTERS = {
         "Steal",
         "Turnover",
         "Foul",
+        "Substitution",  # player enters or leaves the game
     ],
     "nhl": [
         "Goal",
@@ -73,6 +74,7 @@ FILTERS = {
         "Block",
         "Penalty",
         "Save",
+        "Substitution",  # player enters or leaves the ice
     ],
     "pga": [
         "Eagle or better",
@@ -80,7 +82,8 @@ FILTERS = {
         "Par",
         "Bogey",
         "Double Bogey or worse",
-        "Score change",  # catches anything not mapped above
+        "Score change",   # catches anything not mapped above
+        "Shot by Shot",   # per-hole notification as each hole completes
     ],
 }
 
@@ -512,6 +515,43 @@ def track_mlb(sid, game_id, player_ids, player_names, stop_event):
     user_log(sid, "MLB tracker stopped.")
 
 
+def is_substitution_play(play_type: str, sport_label: str) -> bool:
+    """Detect substitution/line-change plays for NBA and NHL."""
+    pt = play_type.lower()
+    if sport_label == "NBA":
+        return "substitution" in pt
+    if sport_label == "NHL":
+        # NHL uses "On Ice" / "Off Ice" or "Substitution"
+        return any(x in pt for x in ("substitution", "on ice", "off ice", "line change"))
+    return False
+
+
+def parse_substitution(play: dict, player_ids: set, player_names: dict, sport_label: str):
+    """
+    Return list of (name, action) tuples for tracked players involved in a sub.
+    ESPN puts both the incoming and outgoing player in participants with a
+    'role' field ("enteredGame" / "leftGame") when available.
+    Falls back to position in list: first = entering, second = leaving.
+    """
+    results = []
+    participants = play.get("participants", [])
+    for i, p in enumerate(participants):
+        pid  = str(p.get("athlete", {}).get("id", "")).strip()
+        role = p.get("type", {}).get("text", "").lower()  # "entered game" / "left game"
+        if pid not in player_ids:
+            continue
+        name = player_names[pid]
+        if "enter" in role or "in" in role:
+            action = "Entered the game"
+        elif "left" in role or "exit" in role or "out" in role:
+            action = "Left the game"
+        else:
+            # Fallback: ESPN sometimes puts entrant first
+            action = "Entered the game" if i == 0 else "Left the game"
+        results.append((name, action))
+    return results
+
+
 def track_espn(sid, sport, league, sport_label, game_id, title, player_ids, player_names, stop_event):
     type_map = NBA_TYPE_MAP if sport_label == "NBA" else NHL_TYPE_MAP
     seen     = set()
@@ -535,18 +575,32 @@ def track_espn(sid, sport, league, sport_label, game_id, title, player_ids, play
                 if not play_id or play_id in seen: continue
                 seen.add(play_id)
 
-                pids     = espn_participants(play)
-                matching = [p for p in pids if p in player_ids]
-                if not matching: continue
-
-                text      = play.get("text","").strip()
                 play_type = play.get("type",{}).get("text","Play")
                 period    = play.get("period",{}).get("number","?")
                 clock     = play.get("clock",{}).get("displayValue","")
                 time_str  = f"Q{period} {clock}" if sport_label=="NBA" else f"P{period} {clock}"
+                text      = play.get("text","").strip()
+
+                # ── Substitution path ────────────────────────
+                if is_substitution_play(play_type, sport_label):
+                    if "Substitution" not in active_filters:
+                        continue
+                    subs = parse_substitution(play, player_ids, player_names, sport_label)
+                    for name, action in subs:
+                        detail = f"{time_str} | {score}\n{action}"
+                        user_log(sid, f"{name}: {action}")
+                        user_alert(sid, name, action, detail, sport_label)
+                        user_notify(sid, f"{sport_label} - {name}: {action}", detail, "default")
+                        new += 1
+                    continue
+
+                # ── Normal play path ─────────────────────────
+                pids     = espn_participants(play)
+                matching = [p for p in pids if p in player_ids]
+                if not matching: continue
+
                 detail    = f"{time_str} | {score}\n{text or play_type}"
 
-                # Filter check
                 event_cat = espn_categorize(play_type, type_map)
                 if event_cat and not passes_filter([event_cat], active_filters):
                     continue
@@ -565,9 +619,27 @@ def track_espn(sid, sport, league, sport_label, game_id, title, player_ids, play
     user_log(sid, f"{sport_label} tracker stopped.")
 
 
+PAR_LABELS = {-3:"Albatross",-2:"Eagle",-1:"Birdie",0:"Par",1:"Bogey",2:"Dbl Bogey"}
+
+def hole_result_label(strokes: int, par: int) -> str:
+    """Return a human label for a hole result."""
+    diff = strokes - par
+    if diff <= -3: return "Albatross or better"
+    return PAR_LABELS.get(diff, f"+{diff}" if diff > 0 else str(diff))
+
+def hole_filter_cat(strokes: int, par: int) -> str:
+    """Map a hole result to a PGA filter category."""
+    diff = strokes - par
+    if diff <= -2: return "Eagle or better"
+    if diff == -1: return "Birdie"
+    if diff ==  0: return "Par"
+    if diff ==  1: return "Bogey"
+    return "Double Bogey or worse"
+
+
 def track_pga(sid, event_id, event_name, player_ids, player_names, stop_event):
-    last_snapshot = {}
-    last_scores   = {}   # pid -> last known score-to-par int
+    last_snapshot  = {}   # pid -> snapshot string for overall score change alerts
+    last_hole_idx  = {}   # pid -> number of completed holes seen last poll
     user_log(sid, f"PGA tracker started — {', '.join(player_names.values())}")
     while not stop_event.is_set():
         try:
@@ -577,32 +649,70 @@ def track_pga(sid, event_id, event_name, player_ids, player_names, stop_event):
                 competitors.extend(comp.get("competitors",[]))
 
             active_filters = get_filters(sid)
+            shot_by_shot   = "Shot by Shot" in active_filters
             new = 0
             for c in competitors:
                 athlete = c.get("athlete",{})
                 pid     = str(athlete.get("id","")).strip()
                 if pid not in player_ids: continue
 
-                name     = player_names[pid]
-                score    = str(c.get("score","")).strip()
-                status   = str(c.get("status","")).strip()
-                ls       = c.get("linescores",[])
-                thru     = str(len([l for l in ls if l.get("value") not in ("","-",None)]))
-                rounds   = [str(r.get("displayValue","")) for r in c.get("rounds",[])]
-                cur_rnd  = rounds[-1] if rounds else "?"
-                snapshot = f"{score}|{thru}|{cur_rnd}|{status}"
+                name   = player_names[pid]
+                score  = str(c.get("score","")).strip()
+                status = str(c.get("status","")).strip()
+                rounds = [str(r.get("displayValue","")) for r in c.get("rounds",[])]
+                cur_rnd = rounds[-1] if rounds else "?"
 
-                if last_snapshot.get(pid) == snapshot: continue
+                # ── Shot-by-shot: per-hole linescores ────────
+                # linescores is a flat list of every hole played this round.
+                # Each entry: {"value": strokes, "par": par_value, ...}
+                linescores = c.get("linescores", [])
+                completed  = [l for l in linescores
+                              if l.get("value") not in ("", "-", None, 0)
+                              and l.get("par") not in ("", None)]
+                prev_count = last_hole_idx.get(pid, 0)
+
+                if shot_by_shot and len(completed) > prev_count:
+                    # Fire a notification for each newly completed hole
+                    for i in range(prev_count, len(completed)):
+                        hole_ls  = completed[i]
+                        hole_num = hole_ls.get("number", i + 1)
+                        try:
+                            strokes = int(hole_ls.get("value", 0))
+                            par     = int(hole_ls.get("par", 0))
+                        except (ValueError, TypeError):
+                            continue
+                        label  = hole_result_label(strokes, par)
+                        detail = (f"Hole {hole_num} — Par {par}\n"
+                                  f"{strokes} stroke{'s' if strokes != 1 else ''} ({label})\n"
+                                  f"Round total: {cur_rnd}  |  Tournament: {score}")
+                        # Check the hole result passes score filter too
+                        hole_cat = hole_filter_cat(strokes, par)
+                        # Shot-by-shot fires regardless of score filters;
+                        # it is its own filter opt-in
+                        user_log(sid, f"{name}: Hole {hole_num} — {label} ({strokes}/{par})")
+                        user_alert(sid, name, f"Hole {hole_num}: {label}", detail, "PGA")
+                        user_notify(sid, f"PGA - {name}: Hole {hole_num} {label}", detail, "high")
+                        new += 1
+
+                last_hole_idx[pid] = len(completed)
+
+                # ── Overall score change alert ────────────────
+                thru     = str(len(completed))
+                snapshot = f"{score}|{thru}|{cur_rnd}|{status}"
+                if last_snapshot.get(pid) == snapshot:
+                    continue
                 last_snapshot[pid] = snapshot
 
-                # Try to parse score-to-par for category mapping
+                # Don't double-fire if shot-by-shot already covered this
+                if shot_by_shot and len(completed) > prev_count:
+                    continue
+
                 try:
                     score_int = int(score.replace("E","0").replace("+",""))
                 except Exception:
                     score_int = None
 
                 event_cats = pga_categorize(score_int) if score_int is not None else ["Score change"]
-
                 if not passes_filter(event_cats, active_filters):
                     continue
 
